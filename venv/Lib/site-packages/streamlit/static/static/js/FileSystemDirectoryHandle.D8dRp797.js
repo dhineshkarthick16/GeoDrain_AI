@@ -1,1 +1,0 @@
-import{FileSystemDirectoryHandle as e}from"./es6.DdnKCs-T.js";export{e as FileSystemDirectoryHandle,e as default};
