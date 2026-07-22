@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large geospatial datasets
+data/input/
+data/processed/
+data/output/
+
+# Large model files
+models/*.h5
+models/*.pt
+models/*.pth
+models/*.onnx
+
+# Generated reports
+reports/generated/
+
+# Temporary files
+*.tmp
+*.log
