@@ -13,9 +13,11 @@ from src.hydrology.flow_direction_visualization import (
     plot_flow_direction_map,
     plot_sink_flat_map,
 )
+from src.hydrology.flow_accumulation_visualization import plot_flow_accumulation_map
 from src.ui.pages.workspace import (
     SESSION_KEY_DEM_ANALYSIS,
     SESSION_KEY_ELEVATION,
+    SESSION_KEY_FLOW_ACCUMULATION,
     SESSION_KEY_FLOW_DIRECTION,
     SESSION_KEY_SLOPE_ASPECT,
     SESSION_KEY_UPLOAD_NAME,
@@ -23,12 +25,13 @@ from src.ui.pages.workspace import (
 
 
 def render_results_page() -> None:
-    """Render the Results page: elevation, slope/aspect, and flow direction."""
+    """Render the Results page: elevation, slope/aspect, flow direction, accumulation."""
     st.header("Analysis Results")
 
     dem_analysis = st.session_state.get(SESSION_KEY_DEM_ANALYSIS)
     slope_aspect_result = st.session_state.get(SESSION_KEY_SLOPE_ASPECT)
     flow_direction_result = st.session_state.get(SESSION_KEY_FLOW_DIRECTION)
+    flow_accumulation_result = st.session_state.get(SESSION_KEY_FLOW_ACCUMULATION)
     elevation = st.session_state.get(SESSION_KEY_ELEVATION)
     uploaded_name = st.session_state.get(SESSION_KEY_UPLOAD_NAME)
 
@@ -140,6 +143,45 @@ def render_results_page() -> None:
 
         st.subheader("Sinks & Flats Map")
         st.pyplot(plot_sink_flat_map(flow_direction_result))
+
+    st.divider()
+
+    if flow_accumulation_result is None:
+        st.info("Flow accumulation has not been computed for this DEM yet.")
+    else:
+        st.subheader("Flow Accumulation Statistics")
+        try:
+            acc_stats = flow_accumulation_result.summary_statistics()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not compute flow accumulation summary statistics: {exc}")
+            acc_stats = None
+
+        if acc_stats is not None:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Max Accumulation (cells)", f"{acc_stats['max_accumulation']:,}")
+            col2.metric("Mean Accumulation (cells)", f"{acc_stats['mean_accumulation']:.1f}")
+            col3.metric(
+                "Terminal Cells",
+                f"{acc_stats['terminal_fraction'] * 100:.1f}%",
+            )
+            st.caption(
+                f"Max contributing area: {acc_stats['max_contributing_area']:.6g} "
+                "(map units squared - only meaningful for a projected CRS)."
+            )
+
+            if acc_stats["terminal_fraction"] > 0:
+                st.caption(
+                    "Terminal cells are where accumulation stops early due to "
+                    "undefined flow direction (sinks/flats) or a downstream "
+                    "nodata edge. This does not indicate a computation error."
+                )
+
+        st.subheader("Flow Accumulation Map")
+        st.caption(
+            "Displayed on a log scale (industry-standard convention), since "
+            "accumulation values typically span several orders of magnitude."
+        )
+        st.pyplot(plot_flow_accumulation_map(flow_accumulation_result))
 
     st.caption(
         "This page presents terrain and hydrology ANALYSIS output only. "
