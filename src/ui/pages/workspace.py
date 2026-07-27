@@ -1,12 +1,13 @@
-"""
+﻿"""
 Workspace page: project configuration, DEM/DTM upload, DEM validation,
-DEM processing, and slope/aspect analysis trigger.
+DEM processing, slope/aspect analysis, and flow direction analysis.
 
-This module contains NO terrain-analysis math itself. It only:
+This module contains NO terrain/hydrology math itself. It only:
   1. Collects user input (project name, study area, file upload).
   2. Calls src.terrain.dem_processor.analyze_dem() for DEM stats.
   3. Calls src.terrain.slope_analysis.compute_slope_aspect() for slope/aspect.
-  4. Stores results in st.session_state for the Results page and the
+  4. Calls src.hydrology.flow_direction.compute_flow_direction() for D8 flow direction.
+  5. Stores results in st.session_state for the Results page and the
      Overview page to consume.
 """
 
@@ -19,20 +20,17 @@ from affine import Affine
 
 from src.terrain.dem_processor import DEMAnalysis, analyze_dem
 from src.terrain.slope_analysis import SlopeAnalysisError, compute_slope_aspect
+from src.hydrology.flow_direction import FlowDirectionError, compute_flow_direction
+from src.utils.crs_utils import is_geographic_crs
 
 logger = logging.getLogger(__name__)
 
-# Session state keys — centralized here so Results page (or any other
-# consumer) references the same constants rather than magic strings.
 SESSION_KEY_ELEVATION = "gd_elevation_array"
 SESSION_KEY_DEM_ANALYSIS = "gd_dem_analysis"
 SESSION_KEY_SLOPE_ASPECT = "gd_slope_aspect_result"
+SESSION_KEY_FLOW_DIRECTION = "gd_flow_direction_result"
 SESSION_KEY_UPLOAD_NAME = "gd_uploaded_dem_name"
 
-# Legacy keys, read by app.py's Overview page. Kept for backward
-# compatibility so Overview's project-status metrics keep working
-# now that Workspace/Results logic lives in this module instead of
-# inline in app.py.
 LEGACY_KEY_PROJECT_INITIALIZED = "project_initialized"
 LEGACY_KEY_PROJECT_NAME = "project_name"
 LEGACY_KEY_STUDY_AREA = "study_area"
@@ -44,30 +42,8 @@ LEGACY_KEY_ELEVATION_ARRAY = "elevation_array"
 def _build_transform_from_resolution(analysis: DEMAnalysis) -> Affine:
     """
     Construct a minimal Affine transform sufficient for slope/aspect math.
-
-    compute_slope_aspect() only reads transform.a (pixel width) and
-    transform.e (pixel height) to derive real-world cell size — it never
-    uses the transform's origin or rotation terms. Because dem_processor.py
-    does not currently expose the dataset's full transform, we build a
-    synthetic one from the resolution values it already returns.
-
-    This is only valid for DEMs in a projected CRS (units = meters/feet).
-    For geographic CRS (degrees), resolution values are NOT true ground
-    distances and slope results would be wrong — see workspace warning.
     """
     return Affine(analysis.resolution_x, 0, 0, 0, -analysis.resolution_y, 0)
-
-
-def _is_geographic_crs(crs_string: str) -> bool:
-    """
-    Best-effort check for a geographic (degree-based) CRS string.
-
-    This is a heuristic, not a full CRS parse — dem_processor.py stores
-    the CRS as a string (str(dataset.crs)), not a pyproj CRS object, so
-    we cannot query .is_geographic directly without changing that module.
-    """
-    lowered = crs_string.lower()
-    return "epsg:4326" in lowered or "longlat" in lowered or "wgs84" in lowered
 
 
 def render_workspace_page() -> None:
@@ -75,10 +51,9 @@ def render_workspace_page() -> None:
     st.header("Project Workspace")
     st.caption(
         "Configure a study area and upload a DEM/DTM GeoTIFF to compute "
-        "elevation statistics and slope/aspect terrain analysis."
+        "elevation statistics, slope/aspect, and flow direction analysis."
     )
 
-    # --- Project configuration (feeds Overview page status only) ---
     st.subheader("Project Configuration")
     config_col1, config_col2 = st.columns(2)
     with config_col1:
@@ -105,13 +80,12 @@ def render_workspace_page() -> None:
         st.info("Upload a DEM/DTM GeoTIFF to begin.")
         return
 
-    run_analysis = st.button("Run DEM & Slope/Aspect Analysis", type="primary")
+    run_analysis = st.button("Run Full Terrain & Hydrology Analysis", type="primary")
 
     if not run_analysis:
         st.caption("File ready. Click the button above to run analysis.")
         return
 
-    # --- Step 1: DEM validation + processing ---
     try:
         with st.spinner("Reading and validating DEM..."):
             elevation, analysis = analyze_dem(uploaded_file)
@@ -119,29 +93,29 @@ def render_workspace_page() -> None:
         st.error(f"DEM validation failed: {exc}")
         logger.warning("DEM validation failed for %s: %s", uploaded_file.name, exc)
         return
-    except Exception as exc:  # noqa: BLE001 - surface unexpected read errors to user
+    except Exception as exc:  # noqa: BLE001
         st.error(f"Could not read DEM file: {exc}")
         logger.exception("Unexpected error reading DEM %s", uploaded_file.name)
         return
 
     st.success("DEM validated and loaded successfully.")
 
-    if _is_geographic_crs(analysis.crs):
+    dem_is_geographic = is_geographic_crs(analysis.crs)
+    if dem_is_geographic:
         st.warning(
             f"Detected CRS '{analysis.crs}' appears to be geographic (degrees), "
-            "not projected (meters/feet). Slope/aspect results below will be "
-            "INCORRECT because cell size is not in true ground units. "
+            "not projected (meters/feet). Slope, aspect, AND flow direction results "
+            "below will be INCORRECT because cell size is not in true ground units. "
             "Reproject the DEM to a projected CRS before relying on these results."
         )
 
-    # --- Step 2: Slope/aspect analysis (only after successful validation) ---
     try:
         transform = _build_transform_from_resolution(analysis)
         with st.spinner("Computing slope and aspect (Horn's method)..."):
             slope_aspect_result = compute_slope_aspect(
                 elevation=elevation,
                 transform=transform,
-                nodata=None,  # dem_processor already converted nodata -> NaN
+                nodata=None,
             )
     except SlopeAnalysisError as exc:
         st.error(f"Slope/aspect analysis could not be completed: {exc}")
@@ -150,13 +124,37 @@ def render_workspace_page() -> None:
 
     st.success("Slope/aspect analysis complete.")
 
-    # --- Step 3: Store results in session state for the Results page ---
+    try:
+        with st.spinner("Computing flow direction (D8 method)..."):
+            flow_direction_result = compute_flow_direction(
+                elevation=elevation,
+                cell_size_x=analysis.resolution_x,
+                cell_size_y=analysis.resolution_y,
+            )
+    except FlowDirectionError as exc:
+        st.error(f"Flow direction analysis could not be completed: {exc}")
+        logger.warning("Flow direction analysis failed: %s", exc)
+        return
+
+    flow_stats = flow_direction_result.summary_statistics()
+    st.success("Flow direction (D8) analysis complete.")
+
+    if flow_stats["sink_count"] > 0 or flow_stats["flat_count"] > 0:
+        st.info(
+            f"Flow direction found {flow_stats['sink_count']} sink cell(s) and "
+            f"{flow_stats['flat_count']} flat cell(s) with no defined downhill "
+            "direction. This is expected on real-world DEMs and does not mean "
+            "the analysis failed - these cells require DEM conditioning "
+            "(sink-filling) in a future phase before flow accumulation can "
+            "route through them correctly."
+        )
+
     st.session_state[SESSION_KEY_ELEVATION] = elevation
     st.session_state[SESSION_KEY_DEM_ANALYSIS] = analysis
     st.session_state[SESSION_KEY_SLOPE_ASPECT] = slope_aspect_result
+    st.session_state[SESSION_KEY_FLOW_DIRECTION] = flow_direction_result
     st.session_state[SESSION_KEY_UPLOAD_NAME] = uploaded_file.name
 
-    # --- Legacy keys for Overview page compatibility ---
     st.session_state[LEGACY_KEY_PROJECT_NAME] = project_name or "Unnamed Project"
     st.session_state[LEGACY_KEY_STUDY_AREA] = study_area or "Not specified"
     st.session_state[LEGACY_KEY_PROJECT_INITIALIZED] = True
