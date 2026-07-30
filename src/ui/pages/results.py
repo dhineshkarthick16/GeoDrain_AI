@@ -14,6 +14,8 @@ from src.hydrology.flow_direction_visualization import (
     plot_sink_flat_map,
 )
 from src.hydrology.flow_accumulation_visualization import plot_flow_accumulation_map
+from src.hydrology.stream_extraction import extract_stream_network, StreamExtractionError
+from src.hydrology.stream_extraction_visualization import plot_stream_network_map
 from src.ui.pages.workspace import (
     SESSION_KEY_DEM_ANALYSIS,
     SESSION_KEY_ELEVATION,
@@ -25,7 +27,7 @@ from src.ui.pages.workspace import (
 
 
 def render_results_page() -> None:
-    """Render the Results page: elevation, slope/aspect, flow direction, accumulation."""
+    """Render the Results page: elevation, slope/aspect, flow direction, accumulation, streams."""
     st.header("Analysis Results")
 
     dem_analysis = st.session_state.get(SESSION_KEY_DEM_ANALYSIS)
@@ -182,6 +184,53 @@ def render_results_page() -> None:
             "accumulation values typically span several orders of magnitude."
         )
         st.pyplot(plot_flow_accumulation_map(flow_accumulation_result))
+
+    st.divider()
+
+    if flow_accumulation_result is None:
+        st.info(
+            "Stream network extraction requires flow accumulation results, "
+            "which have not been computed for this DEM yet."
+        )
+    else:
+        st.subheader("Stream Network Extraction")
+        st.caption(
+            "Cells are classified as drainage channels when their flow "
+            "accumulation exceeds a percentile threshold of the accumulation "
+            "distribution. This is a raster classification, not a vector "
+            "stream network - connected line geometry (for GIS/HEC-RAS "
+            "export) is a planned future phase."
+        )
+
+        percentile = st.slider(
+            "Stream threshold percentile (higher = sparser, more selective network)",
+            min_value=90.0,
+            max_value=99.9,
+            value=99.0,
+            step=0.1,
+            key="stream_percentile_slider",
+        )
+
+        try:
+            stream_result = extract_stream_network(
+                accumulation=flow_accumulation_result.accumulation,
+                valid_mask=flow_accumulation_result.valid_mask,
+                percentile_threshold=percentile,
+            )
+        except StreamExtractionError as exc:
+            st.error(f"Stream extraction could not be completed: {exc}")
+            stream_result = None
+
+        if stream_result is not None:
+            stream_stats = stream_result.summary_statistics()
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Stream Cells", f"{stream_stats['stream_cell_count']:,}")
+            col2.metric("Stream Fraction", f"{stream_stats['stream_fraction'] * 100:.2f}%")
+            col3.metric("Accumulation Threshold", f"{stream_stats['threshold_value']:.1f}")
+
+            st.pyplot(
+                plot_stream_network_map(flow_accumulation_result, stream_result)
+            )
 
     st.caption(
         "This page presents terrain and hydrology ANALYSIS output only. "
