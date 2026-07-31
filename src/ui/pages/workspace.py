@@ -1,14 +1,17 @@
 ﻿"""
 Workspace page: project configuration, DEM/DTM upload, DEM validation,
-DEM processing, slope/aspect analysis, flow direction, and flow accumulation.
+optional DEM conditioning (sink filling), and the full terrain/hydrology
+analysis pipeline.
 
 This module contains NO terrain/hydrology math itself. It only:
   1. Collects user input (project name, study area, file upload).
   2. Calls src.terrain.dem_processor.analyze_dem() for DEM stats.
-  3. Calls src.terrain.slope_analysis.compute_slope_aspect() for slope/aspect.
-  4. Calls src.hydrology.flow_direction.compute_flow_direction() for D8 flow direction.
-  5. Calls src.hydrology.flow_accumulation.compute_flow_accumulation() for accumulation.
-  6. Stores results in st.session_state for the Results page and the
+  3. Optionally calls src.preprocessing.dem_conditioning.fill_sinks() to
+     produce a sink-filled elevation array, on explicit user request.
+  4. Calls src.terrain.slope_analysis.compute_slope_aspect() for slope/aspect.
+  5. Calls src.hydrology.flow_direction.compute_flow_direction() for D8 flow direction.
+  6. Calls src.hydrology.flow_accumulation.compute_flow_accumulation() for accumulation.
+  7. Stores results in st.session_state for the Results page and the
      Overview page to consume.
 """
 
@@ -26,6 +29,7 @@ from src.hydrology.flow_accumulation import (
     FlowAccumulationError,
     compute_flow_accumulation,
 )
+from src.preprocessing.dem_conditioning import DEMConditioningError, fill_sinks
 from src.utils.crs_utils import is_geographic_crs
 
 logger = logging.getLogger(__name__)
@@ -36,6 +40,10 @@ SESSION_KEY_SLOPE_ASPECT = "gd_slope_aspect_result"
 SESSION_KEY_FLOW_DIRECTION = "gd_flow_direction_result"
 SESSION_KEY_FLOW_ACCUMULATION = "gd_flow_accumulation_result"
 SESSION_KEY_UPLOAD_NAME = "gd_uploaded_dem_name"
+
+SESSION_KEY_CONDITIONED_DEM = "gd_conditioned_dem_result"
+SESSION_KEY_CONDITIONED_SOURCE_NAME = "gd_conditioned_source_name"
+SESSION_KEY_USED_CONDITIONED = "gd_used_conditioned_elevation"
 
 LEGACY_KEY_PROJECT_INITIALIZED = "project_initialized"
 LEGACY_KEY_PROJECT_NAME = "project_name"
@@ -51,7 +59,7 @@ def _build_transform_from_resolution(analysis: DEMAnalysis) -> Affine:
 
 
 def render_workspace_page() -> None:
-    """Render the Workspace page: configure project, upload, validate, analyze."""
+    """Render the Workspace page: configure project, upload, validate, condition, analyze."""
     st.header("Project Workspace")
     st.caption(
         "Configure a study area and upload a DEM/DTM GeoTIFF to compute "
@@ -85,6 +93,75 @@ def render_workspace_page() -> None:
         st.info("Upload a DEM/DTM GeoTIFF to begin.")
         return
 
+    st.divider()
+    st.subheader("Optional: DEM Conditioning (Sink Filling)")
+    st.caption(
+        "Real-world DEMs commonly contain depressions (sinks) and flat "
+        "areas that break flow-direction routing (see analysis results for "
+        "how many). Conditioning fills these depressions so downstream "
+        "flow direction, accumulation, and watershed results are more "
+        "complete. This is OPTIONAL and modifies elevation values in "
+        "filled areas - it does not change your original uploaded file. "
+        "On large DEMs this can take under a minute."
+    )
+
+    already_conditioned = (
+        st.session_state.get(SESSION_KEY_CONDITIONED_SOURCE_NAME) == uploaded_file.name
+    )
+    if already_conditioned:
+        cond_result = st.session_state[SESSION_KEY_CONDITIONED_DEM]
+        cond_stats = cond_result.summary_statistics()
+        st.success(
+            f"DEM already conditioned: {cond_stats['cells_modified']:,} cells "
+            f"modified ({cond_stats['cells_modified_fraction']*100:.2f}%), "
+            f"max fill depth {cond_stats['max_fill_depth']:.2f}. This "
+            "conditioned elevation will be used automatically when you run "
+            "the analysis below."
+        )
+
+    run_conditioning = st.button(
+        "Condition DEM (Fill Sinks)" if not already_conditioned
+        else "Re-run DEM Conditioning",
+        type="secondary",
+    )
+
+    if run_conditioning:
+        try:
+            with st.spinner("Validating DEM..."):
+                cond_elevation, cond_analysis = analyze_dem(uploaded_file)
+        except (ValueError, Exception) as exc:  # noqa: BLE001
+            st.error(f"Could not read DEM for conditioning: {exc}")
+            cond_elevation = None
+
+        if cond_elevation is not None:
+            try:
+                with st.spinner(
+                    "Filling sinks (priority-flood algorithm) - this is a "
+                    "sequential pass and can take under a minute on large "
+                    "DEMs, please wait..."
+                ):
+                    conditioned_result = fill_sinks(cond_elevation)
+            except DEMConditioningError as exc:
+                st.error(f"DEM conditioning could not be completed: {exc}")
+                logger.warning("DEM conditioning failed: %s", exc)
+            else:
+                st.session_state[SESSION_KEY_CONDITIONED_DEM] = conditioned_result
+                st.session_state[SESSION_KEY_CONDITIONED_SOURCE_NAME] = uploaded_file.name
+                cond_stats = conditioned_result.summary_statistics()
+                st.success(
+                    f"DEM conditioning complete: {cond_stats['cells_modified']:,} "
+                    f"cells modified ({cond_stats['cells_modified_fraction']*100:.2f}%), "
+                    f"max fill depth {cond_stats['max_fill_depth']:.2f}."
+                )
+                st.info(
+                    "This conditioned elevation will be used automatically "
+                    "the next time you run the full analysis below."
+                )
+                st.rerun()
+
+    st.divider()
+    st.subheader("Run Analysis")
+
     run_analysis = st.button("Run Full Terrain & Hydrology Analysis", type="primary")
 
     if not run_analysis:
@@ -115,11 +192,29 @@ def render_workspace_page() -> None:
             "relying on these results."
         )
 
+    used_conditioned = (
+        st.session_state.get(SESSION_KEY_CONDITIONED_SOURCE_NAME) == uploaded_file.name
+    )
+    if used_conditioned:
+        conditioned_result = st.session_state[SESSION_KEY_CONDITIONED_DEM]
+        elevation_for_analysis = conditioned_result.filled_elevation
+        st.info(
+            "Using SINK-FILLED elevation for this analysis (from DEM "
+            "Conditioning above). Elevation values in filled areas have "
+            "been modified from the original raw DEM."
+        )
+    else:
+        elevation_for_analysis = elevation
+        st.caption(
+            "Using RAW (unconditioned) elevation for this analysis. Run "
+            "DEM Conditioning above first if you want sink-filled results."
+        )
+
     try:
         transform = _build_transform_from_resolution(analysis)
         with st.spinner("Computing slope and aspect (Horn's method)..."):
             slope_aspect_result = compute_slope_aspect(
-                elevation=elevation,
+                elevation=elevation_for_analysis,
                 transform=transform,
                 nodata=None,
             )
@@ -133,7 +228,7 @@ def render_workspace_page() -> None:
     try:
         with st.spinner("Computing flow direction (D8 method)..."):
             flow_direction_result = compute_flow_direction(
-                elevation=elevation,
+                elevation=elevation_for_analysis,
                 cell_size_x=analysis.resolution_x,
                 cell_size_y=analysis.resolution_y,
             )
@@ -149,10 +244,14 @@ def render_workspace_page() -> None:
         st.info(
             f"Flow direction found {flow_stats['sink_count']} sink cell(s) and "
             f"{flow_stats['flat_count']} flat cell(s) with no defined downhill "
-            "direction. This is expected on real-world DEMs and does not mean "
-            "the analysis failed - these cells require DEM conditioning "
-            "(sink-filling) in a future phase before flow accumulation can "
-            "route through them correctly."
+            "direction. "
+            + (
+                "Even after conditioning, some flats can remain (a known "
+                "property of sink filling - see engineering notes)."
+                if used_conditioned else
+                "This is expected on unconditioned real-world DEMs - try "
+                "DEM Conditioning above to reduce this."
+            )
         )
 
     try:
@@ -161,7 +260,7 @@ def render_workspace_page() -> None:
             "longer than earlier steps on large DEMs - please wait)..."
         ):
             flow_accumulation_result = compute_flow_accumulation(
-                elevation=elevation,
+                elevation=elevation_for_analysis,
                 direction=flow_direction_result.direction,
                 cell_size_x=analysis.resolution_x,
                 cell_size_y=analysis.resolution_y,
@@ -178,23 +277,22 @@ def render_workspace_page() -> None:
         st.info(
             f"Flow accumulation stops early at {acc_stats['terminal_cell_count']} "
             f"cell(s) ({acc_stats['terminal_fraction'] * 100:.1f}% of valid cells) "
-            "where no defined downhill direction exists. Accumulation counts "
-            "upstream of these points do not continue past them - this is an "
-            "honest limitation of unconditioned terrain, not a computation error."
+            "where no defined downhill direction exists."
         )
 
-    st.session_state[SESSION_KEY_ELEVATION] = elevation
+    st.session_state[SESSION_KEY_ELEVATION] = elevation_for_analysis
     st.session_state[SESSION_KEY_DEM_ANALYSIS] = analysis
     st.session_state[SESSION_KEY_SLOPE_ASPECT] = slope_aspect_result
     st.session_state[SESSION_KEY_FLOW_DIRECTION] = flow_direction_result
     st.session_state[SESSION_KEY_FLOW_ACCUMULATION] = flow_accumulation_result
     st.session_state[SESSION_KEY_UPLOAD_NAME] = uploaded_file.name
+    st.session_state[SESSION_KEY_USED_CONDITIONED] = used_conditioned
 
     st.session_state[LEGACY_KEY_PROJECT_NAME] = project_name or "Unnamed Project"
     st.session_state[LEGACY_KEY_STUDY_AREA] = study_area or "Not specified"
     st.session_state[LEGACY_KEY_PROJECT_INITIALIZED] = True
     st.session_state[LEGACY_KEY_DEM_FILE_NAME] = uploaded_file.name
     st.session_state[LEGACY_KEY_TERRAIN_ANALYSIS] = analysis
-    st.session_state[LEGACY_KEY_ELEVATION_ARRAY] = elevation
+    st.session_state[LEGACY_KEY_ELEVATION_ARRAY] = elevation_for_analysis
 
     st.info("Analysis stored. Open the Results page to view outputs.")
