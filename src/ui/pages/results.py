@@ -5,6 +5,7 @@ Results page: reads analysis results from session state and displays them.
 from __future__ import annotations
 
 import streamlit as st
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 from src.terrain.slope_analysis import compass_label
 from src.terrain.slope_visualization import plot_aspect_map, plot_slope_map
@@ -16,6 +17,19 @@ from src.hydrology.flow_direction_visualization import (
 from src.hydrology.flow_accumulation_visualization import plot_flow_accumulation_map
 from src.hydrology.stream_extraction import extract_stream_network, StreamExtractionError
 from src.hydrology.stream_extraction_visualization import plot_stream_network_map
+from src.hydrology.watershed_delineation import (
+    delineate_catchment,
+    WatershedDelineationError,
+)
+from src.hydrology.watershed_visualization import (
+    build_pour_point_selector_image,
+    plot_catchment_map,
+)
+from src.hydrology.flood_susceptibility import (
+    compute_flood_susceptibility,
+    FloodSusceptibilityError,
+)
+from src.hydrology.flood_susceptibility_visualization import plot_susceptibility_map
 from src.ui.pages.workspace import (
     SESSION_KEY_DEM_ANALYSIS,
     SESSION_KEY_ELEVATION,
@@ -27,7 +41,7 @@ from src.ui.pages.workspace import (
 
 
 def render_results_page() -> None:
-    """Render the Results page: elevation, slope/aspect, flow direction, accumulation, streams."""
+    """Render the Results page: elevation, slope/aspect, flow direction, accumulation, streams, watershed, susceptibility."""
     st.header("Analysis Results")
 
     dem_analysis = st.session_state.get(SESSION_KEY_DEM_ANALYSIS)
@@ -187,6 +201,7 @@ def render_results_page() -> None:
 
     st.divider()
 
+    stream_result = None
     if flow_accumulation_result is None:
         st.info(
             "Stream network extraction requires flow accumulation results, "
@@ -231,6 +246,130 @@ def render_results_page() -> None:
             st.pyplot(
                 plot_stream_network_map(flow_accumulation_result, stream_result)
             )
+
+    st.divider()
+
+    if flow_direction_result is None or flow_accumulation_result is None:
+        st.info(
+            "Watershed / catchment delineation requires flow direction and "
+            "flow accumulation results, which have not been computed for "
+            "this DEM yet."
+        )
+    else:
+        st.subheader("Watershed / Catchment Delineation")
+        st.caption(
+            "Click a point on the map below to select a pour point. The "
+            "catchment (every cell whose flow path drains through that "
+            "point) will be delineated and highlighted. This delineates a "
+            "single chosen catchment, not automatic whole-DEM basin "
+            "labeling - see engineering notes for why."
+        )
+
+        click_image, click_stride = build_pour_point_selector_image(
+            flow_accumulation_result.accumulation,
+            flow_accumulation_result.valid_mask,
+        )
+        coords = streamlit_image_coordinates(click_image, key="pour_point_selector")
+
+        if coords is None:
+            st.info("Click anywhere on the map above to select a pour point.")
+        else:
+            img_w, img_h = click_image.size
+            disp_w = coords.get("width") or img_w
+            disp_h = coords.get("height") or img_h
+            scale_x = img_w / disp_w if disp_w else 1.0
+            scale_y = img_h / disp_h if disp_h else 1.0
+
+            thumb_col = int(coords["x"] * scale_x)
+            thumb_row = int(coords["y"] * scale_y)
+
+            max_row = flow_direction_result.direction.shape[0] - 1
+            max_col = flow_direction_result.direction.shape[1] - 1
+            pour_row = min(thumb_row * click_stride, max_row)
+            pour_col = min(thumb_col * click_stride, max_col)
+
+            st.caption(f"Selected pour point: row {pour_row}, column {pour_col}")
+
+            try:
+                catchment_result = delineate_catchment(
+                    direction=flow_direction_result.direction,
+                    valid_mask=flow_direction_result.valid_mask,
+                    pour_row=pour_row,
+                    pour_col=pour_col,
+                    cell_size_x=dem_analysis.resolution_x,
+                    cell_size_y=dem_analysis.resolution_y,
+                )
+            except WatershedDelineationError as exc:
+                st.error(
+                    f"Could not delineate catchment at this point: {exc} "
+                    "Try clicking a different location."
+                )
+                catchment_result = None
+
+            if catchment_result is not None:
+                col1, col2 = st.columns(2)
+                col1.metric("Catchment Cells", f"{catchment_result.cell_count:,}")
+                col2.metric(
+                    "Catchment Area",
+                    f"{catchment_result.area:.6g} (map units squared)",
+                )
+                st.pyplot(
+                    plot_catchment_map(flow_accumulation_result, catchment_result)
+                )
+
+    st.divider()
+
+    if flow_accumulation_result is None or stream_result is None:
+        st.info(
+            "Flood susceptibility requires flow accumulation and stream "
+            "extraction results, which are not both available yet."
+        )
+    else:
+        st.subheader("Flood Susceptibility Indicator")
+        st.warning(
+            "SCOPE NOTE: this is a TERRAIN-BASED SUSCEPTIBILITY SCREENING "
+            "INDICATOR, not a validated flood-risk model. It combines slope, "
+            "flow accumulation, and proximity to the extracted stream network "
+            "above using equal, assumption-based weights - it does NOT use "
+            "rainfall, soil, or land-use data, and has not been calibrated "
+            "against any observed flood record. Use for screening/discussion "
+            "only; any real decision requires engineering validation."
+        )
+
+        try:
+            susceptibility_result = compute_flood_susceptibility(
+                slope_percent=slope_aspect_result.slope_percent,
+                accumulation=flow_accumulation_result.accumulation,
+                stream_mask=stream_result.stream_mask,
+                valid_mask=flow_accumulation_result.valid_mask,
+            )
+        except FloodSusceptibilityError as exc:
+            st.error(f"Flood susceptibility could not be computed: {exc}")
+            susceptibility_result = None
+
+        if susceptibility_result is not None:
+            sus_stats = susceptibility_result.summary_statistics()
+            col1, col2, col3 = st.columns(3)
+            col1.metric(
+                "Low Susceptibility",
+                f"{sus_stats['low_count']:,} "
+                f"({sus_stats['low_count'] / sus_stats['valid_cell_count'] * 100:.1f}%)",
+            )
+            col2.metric(
+                "Moderate Susceptibility",
+                f"{sus_stats['moderate_count']:,} "
+                f"({sus_stats['moderate_count'] / sus_stats['valid_cell_count'] * 100:.1f}%)",
+            )
+            col3.metric(
+                "High Susceptibility",
+                f"{sus_stats['high_count']:,} "
+                f"({sus_stats['high_fraction'] * 100:.1f}%)",
+            )
+            st.caption(
+                "Weights used: slope=1/3, flow accumulation=1/3, stream "
+                "proximity=1/3 (equal weighting, not calibrated to real data)."
+            )
+            st.pyplot(plot_susceptibility_map(susceptibility_result))
 
     st.caption(
         "This page presents terrain and hydrology ANALYSIS output only. "
