@@ -271,9 +271,25 @@ def render_results_page() -> None:
         )
         coords = streamlit_image_coordinates(click_image, key="pour_point_selector")
 
-        if coords is None:
-            st.info("Click anywhere on the map above to select a pour point.")
-        else:
+        max_row = flow_direction_result.direction.shape[0] - 1
+        max_col = flow_direction_result.direction.shape[1] - 1
+
+        with st.expander("Enter row/column manually"):
+            manual_row = st.number_input(
+                "Row", min_value=0, max_value=max_row, value=0, step=1,
+                key="manual_pour_row",
+            )
+            manual_col = st.number_input(
+                "Column", min_value=0, max_value=max_col, value=0, step=1,
+                key="manual_pour_col",
+            )
+            manual_submitted = st.button("Use these coordinates")
+
+        pour_row = pour_col = None
+
+        if manual_submitted:
+            pour_row, pour_col = int(manual_row), int(manual_col)
+        elif coords is not None:
             img_w, img_h = click_image.size
             disp_w = coords.get("width") or img_w
             disp_h = coords.get("height") or img_h
@@ -283,11 +299,15 @@ def render_results_page() -> None:
             thumb_col = int(coords["x"] * scale_x)
             thumb_row = int(coords["y"] * scale_y)
 
-            max_row = flow_direction_result.direction.shape[0] - 1
-            max_col = flow_direction_result.direction.shape[1] - 1
             pour_row = min(thumb_row * click_stride, max_row)
             pour_col = min(thumb_col * click_stride, max_col)
 
+        if pour_row is None:
+            st.info(
+                "Click anywhere on the map above, or expand 'Enter row/column "
+                "manually' below, to select a pour point."
+            )
+        else:
             st.caption(f"Selected pour point: row {pour_row}, column {pour_col}")
 
             try:
