@@ -4,6 +4,8 @@ Results page: reads analysis results from session state and displays them.
 
 from __future__ import annotations
 
+import io
+
 import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 
@@ -17,6 +19,11 @@ from src.hydrology.flow_direction_visualization import (
 from src.hydrology.flow_accumulation_visualization import plot_flow_accumulation_map
 from src.hydrology.stream_extraction import extract_stream_network, StreamExtractionError
 from src.hydrology.stream_extraction_visualization import plot_stream_network_map
+from src.hydrology.stream_vectorization import (
+    vectorize_stream_network,
+    geojson_bytes,
+    StreamVectorizationError,
+)
 from src.hydrology.watershed_delineation import (
     delineate_catchment,
     WatershedDelineationError,
@@ -38,6 +45,33 @@ from src.ui.pages.workspace import (
     SESSION_KEY_SLOPE_ASPECT,
     SESSION_KEY_UPLOAD_NAME,
 )
+
+# Session keys populated by this page for the Engineering Reports page to
+# consume. These reflect the LAST rendered stream / susceptibility /
+# catchment result (i.e. whatever threshold / pour point was last selected).
+SESSION_KEY_STREAM_RESULT = "gd_stream_result"
+SESSION_KEY_SUSCEPTIBILITY_RESULT = "gd_susceptibility_result"
+SESSION_KEY_CATCHMENT_RESULT = "gd_catchment_result"
+SESSION_KEY_CATCHMENT_POUR_POINT = "gd_catchment_pour_point"
+
+# PNG bytes of key figures, captured for inclusion in the PDF report.
+# Keyed by a short fixed name (e.g. "elevation", "slope"). Populated as
+# this page renders each figure.
+SESSION_KEY_REPORT_IMAGES = "gd_report_images"
+
+
+def _capture_figure(fig, key: str) -> None:
+    """Save a matplotlib figure as PNG bytes into session state for the
+    Engineering Reports page to embed later. Best-effort - failures here
+    should never break the Results page itself."""
+    try:
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        buf.seek(0)
+        images = st.session_state.setdefault(SESSION_KEY_REPORT_IMAGES, {})
+        images[key] = buf.getvalue()
+    except Exception:  # noqa: BLE001 - report images are best-effort only
+        pass
 
 
 def render_results_page() -> None:
@@ -85,6 +119,7 @@ def render_results_page() -> None:
         try:
             elevation_fig = create_elevation_figure(elevation)
             st.pyplot(elevation_fig, width="stretch")
+            _capture_figure(elevation_fig, "elevation")
         except Exception as exc:  # noqa: BLE001
             st.error(f"Elevation visualization failed: {exc}")
     else:
@@ -117,6 +152,7 @@ def render_results_page() -> None:
     )
     slope_fig = plot_slope_map(slope_aspect_result, units=slope_units)
     st.pyplot(slope_fig)
+    _capture_figure(slope_fig, "slope")
 
     st.subheader("Aspect Map")
     aspect_fig = plot_aspect_map(slope_aspect_result)
@@ -197,7 +233,9 @@ def render_results_page() -> None:
             "Displayed on a log scale (industry-standard convention), since "
             "accumulation values typically span several orders of magnitude."
         )
-        st.pyplot(plot_flow_accumulation_map(flow_accumulation_result))
+        acc_fig = plot_flow_accumulation_map(flow_accumulation_result)
+        st.pyplot(acc_fig)
+        _capture_figure(acc_fig, "flow_accumulation")
 
     st.divider()
 
@@ -212,9 +250,9 @@ def render_results_page() -> None:
         st.caption(
             "Cells are classified as drainage channels when their flow "
             "accumulation exceeds a percentile threshold of the accumulation "
-            "distribution. This is a raster classification, not a vector "
-            "stream network - connected line geometry (for GIS/HEC-RAS "
-            "export) is a planned future phase."
+            "distribution. This raster classification can also be exported "
+            "as connected vector line geometry (GeoJSON, below the map) "
+            "for GIS/HEC-RAS use."
         )
 
         percentile = st.slider(
@@ -236,6 +274,8 @@ def render_results_page() -> None:
             st.error(f"Stream extraction could not be completed: {exc}")
             stream_result = None
 
+        st.session_state[SESSION_KEY_STREAM_RESULT] = stream_result
+
         if stream_result is not None:
             stream_stats = stream_result.summary_statistics()
             col1, col2, col3 = st.columns(3)
@@ -243,9 +283,31 @@ def render_results_page() -> None:
             col2.metric("Stream Fraction", f"{stream_stats['stream_fraction'] * 100:.2f}%")
             col3.metric("Accumulation Threshold", f"{stream_stats['threshold_value']:.1f}")
 
-            st.pyplot(
-                plot_stream_network_map(flow_accumulation_result, stream_result)
-            )
+            stream_fig = plot_stream_network_map(flow_accumulation_result, stream_result)
+            st.pyplot(stream_fig)
+            _capture_figure(stream_fig, "streams")
+
+            try:
+                vector_result = vectorize_stream_network(
+                    stream_mask=stream_result.stream_mask,
+                    transform=dem_analysis.transform,
+                    crs=dem_analysis.crs,
+                )
+            except StreamVectorizationError as exc:
+                st.caption(f"Vector export unavailable: {exc}")
+            else:
+                st.caption(
+                    f"Vector network: {vector_result.line_count} line "
+                    f"segment(s), {vector_result.total_length:,.0f} total "
+                    "length (map units, meters for a projected CRS)."
+                )
+                st.download_button(
+                    "Download Stream Network (GeoJSON)",
+                    data=geojson_bytes(vector_result),
+                    file_name="stream_network.geojson",
+                    mime="application/geo+json",
+                    key="stream_geojson_download",
+                )
 
     st.divider()
 
@@ -333,8 +395,14 @@ def render_results_page() -> None:
                     "Catchment Area",
                     f"{catchment_result.area:.6g} (map units squared)",
                 )
-                st.pyplot(
-                    plot_catchment_map(flow_accumulation_result, catchment_result)
+                catchment_fig = plot_catchment_map(flow_accumulation_result, catchment_result)
+                st.pyplot(catchment_fig)
+                _capture_figure(catchment_fig, "catchment")
+
+                st.session_state[SESSION_KEY_CATCHMENT_RESULT] = catchment_result
+                st.session_state[SESSION_KEY_CATCHMENT_POUR_POINT] = (
+                    pour_row,
+                    pour_col,
                 )
 
     st.divider()
@@ -389,7 +457,11 @@ def render_results_page() -> None:
                 "Weights used: slope=1/3, flow accumulation=1/3, stream "
                 "proximity=1/3 (equal weighting, not calibrated to real data)."
             )
-            st.pyplot(plot_susceptibility_map(susceptibility_result))
+            susc_fig = plot_susceptibility_map(susceptibility_result)
+            st.pyplot(susc_fig)
+            _capture_figure(susc_fig, "susceptibility")
+
+        st.session_state[SESSION_KEY_SUSCEPTIBILITY_RESULT] = susceptibility_result
 
     st.caption(
         "This page presents terrain and hydrology ANALYSIS output only. "

@@ -19,6 +19,7 @@ class DEMAnalysis:
     resolution_x: float
     resolution_y: float
     nodata_value: Any
+    transform: Any = None
 
 
 def analyze_dem(file_object) -> tuple[np.ndarray, DEMAnalysis]:
@@ -98,7 +99,9 @@ def analyze_dem(file_object) -> tuple[np.ndarray, DEMAnalysis]:
                     dataset.res[1]
                 ),
 
-                nodata_value=nodata
+                nodata_value=nodata,
+
+                transform=dataset.transform
             )
 
     return elevation, analysis

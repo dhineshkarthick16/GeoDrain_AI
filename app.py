@@ -5,6 +5,7 @@ from src.ui.components.sidebar import render_sidebar
 
 from src.ui.pages.workspace import render_workspace_page
 from src.ui.pages.results import render_results_page
+from src.ui.pages.reports import render_reports_page
 
 
 # ==========================================
@@ -258,29 +259,4 @@ elif selected_page == "Analysis Results":
 
 elif selected_page == "Engineering Reports":
 
-    st.caption("ENGINEERING OUTPUT")
-
-    st.title("Engineering Reports")
-
-    st.write(
-        "Generated drainage plans, hydraulic outputs and "
-        "panchayat-ready reports will appear here."
-    )
-
-    st.divider()
-
-    if st.session_state.get(
-        "project_initialized",
-        False
-    ):
-
-        st.info(
-            "Engineering report generation will become available "
-            "after terrain and hydrological analysis is completed."
-        )
-
-    else:
-
-        st.info(
-            "No engineering report has been generated yet."
-        )
+    render_reports_page()

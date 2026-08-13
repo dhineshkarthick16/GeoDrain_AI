@@ -68,3 +68,6 @@ watchdog==6.0.0
 websockets==16.1.1
 xyzservices==2026.3.0
 streamlit-image-coordinates==0.1.9
+fpdf2==2.8.8
+scikit-image==0.26.0
+sknw==0.1.5
